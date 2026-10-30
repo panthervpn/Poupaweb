@@ -1,0 +1,160 @@
+name: Gerar APK Rebrand
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nome do App'
+        required: true
+      reseller_id:
+        description: 'ID do Revendedor'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Baixar Codigo do Repositorio
+        uses: actions/checkout@v4
+
+      - name: Reportar Status - Instalando Dependencias
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Instalando dependências (1/6)...\"}"
+
+      - name: Instalar Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner openjdk-17-jdk jq imagemagick zip unzip
+          
+          # Instalar a última versão do apktool manualmente (resolve bug do aapt e attrs)
+          wget https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool
+          wget https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          mv apktool_2.9.3.jar apktool.jar
+          sudo mv apktool /usr/local/bin/
+          sudo mv apktool.jar /usr/local/bin/
+          sudo chmod +x /usr/local/bin/apktool
+          sudo chmod +x /usr/local/bin/apktool.jar
+
+      - name: Reportar Status - Extraindo APK
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Extraindo base do App (2/6)...\"}"
+
+      - name: Extrair APK Base
+        run: |
+          apktool d -s base.apk -o app_extraido
+
+      - name: Reportar Status - Injetando Dados
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Injetando Nome e Ícone (3/6)...\"}"
+
+      - name: Injetar ID e Nome do App
+        run: |
+          mkdir -p app_extraido/assets
+          echo -n "${{ github.event.inputs.reseller_id }}" > app_extraido/assets/reseller_id.txt
+          
+          # Tenta alterar o Nome do Aplicativo escrito debaixo do ícone
+          sed -i -E "s/<string name=\"app_name\">[^<]+<\/string>/<string name=\"app_name\">${{ github.event.inputs.app_name }}<\/string>/g" app_extraido/res/values/strings.xml || true
+
+      - name: Baixar e Converter Imagens
+        run: |
+          RESELLER_ID="${{ github.event.inputs.reseller_id }}"
+          ASSETS=$(curl -s -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" "https://banco-de-dados.blindervpn.workers.dev/?action=get_rebrand_assets&reseller_id=$RESELLER_ID")
+          
+          LOGO_B64=$(echo "$ASSETS" | jq -r '.logo_b64 // empty')
+          BG_B64=$(echo "$ASSETS" | jq -r '.bg_b64 // empty')
+
+          if [ -n "$LOGO_B64" ]; then
+            echo "$LOGO_B64" | base64 -d > raw_logo
+            convert raw_logo -resize 512x512 PNG32:nova_logo.png
+            find app_extraido/res -name "logo.png" -exec cp nova_logo.png {} +
+            find app_extraido/res -name "ic_launcher.png" -exec cp nova_logo.png {} +
+          fi
+
+          if [ -n "$BG_B64" ]; then
+            echo "$BG_B64" | base64 -d > raw_bg
+            convert raw_bg PNG32:novo_fundo.png
+            find app_extraido/res -name "fundo.png" -exec cp novo_fundo.png {} +
+          fi
+
+      - name: Reportar Status - Reempacotando
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Compilando novo APK (4/6)...\"}"
+
+      - name: Reempacotar APK
+        run: |
+          apktool b app_extraido -o app_modificado.apk
+
+      - name: Reportar Status - Assinando
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Assinando Aplicativo (5/6)...\"}"
+
+      - name: Alinhar e Assinar APK
+        run: |
+          if [ ! -f release.jks ]; then
+            echo "Gerando nova keystore e salvando no repositorio..."
+            keytool -genkey -v -keystore release.jks -alias alias -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=IPTV, OU=App, O=Rebrand, L=BR, S=BR, C=BR"
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add release.jks
+            git commit -m "Salvar keystore para manter a mesma assinatura nas proximas atualizacoes"
+            git push
+          else
+            echo "Keystore encontrada. Usando a mesma assinatura."
+          fi
+          zipalign -v -p 4 app_modificado.apk app_alinhado.apk
+          apksigner sign --ks release.jks --ks-pass pass:123456 --key-pass pass:123456 --out app_final.apk app_alinhado.apk
+
+      - name: Reportar Status - Publicando
+        run: |
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_status" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"status\": \"Gerando link de download (6/6)...\"}"
+
+      - name: Publicar APK no GitHub Releases e Notificar Painel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Publicando APK diretamente no GitHub Releases..."
+          
+          # Renomeia o APK para o nome do app (troca espaços por underline para não quebrar o link)
+          SAFE_NAME=$(echo "${{ github.event.inputs.app_name }}" | tr ' ' '_')
+          mv app_final.apk "${SAFE_NAME}.apk"
+          
+          TAG="app-${{ github.event.inputs.reseller_id }}"
+          
+          # Remove release anterior caso o revendedor esteja recriando o app
+          gh release delete "$TAG" --yes || true
+          git push --delete origin "$TAG" || true
+          
+          # Cria a Release oficial dentro do proprio GitHub
+          gh release create "$TAG" "${SAFE_NAME}.apk" \
+            --title "${{ github.event.inputs.app_name }}" \
+            --notes "APK gerado automaticamente para o revendedor ${{ github.event.inputs.reseller_id }}"
+          
+          # URL direta oficial do GitHub (baixa exatamente como .apk)
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${SAFE_NAME}.apk"
+          echo "URL do APK: $DOWNLOAD_URL"
+          
+          curl -s -X POST "https://banco-de-dados.blindervpn.workers.dev/?action=set_rebrand_link" \
+            -H "X-Auth-Token: B7f9a2XkP1mQz8vL4wYc" \
+            -H "Content-Type: application/json" \
+            -d "{\"reseller_id\": \"${{ github.event.inputs.reseller_id }}\", \"url\": \"$DOWNLOAD_URL\"}"
